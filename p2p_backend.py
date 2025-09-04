@@ -1,13 +1,21 @@
 import os
 import json
 import hashlib
+from datetime import datetime
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 
-# === File storage ===
-USERS_FILE = "users.json"
-PROFILE_FILE = "profile.json"
-KEY_FILE = "private_key.pem"
+
+# === Paths ===
+DATA_DIR = os.path.expanduser("~/.p2pchat")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+PROFILE_FILE = os.path.join(DATA_DIR, "profile.json")
+KEY_FILE = os.path.join(DATA_DIR, "private_key.pem")
+PEERS_FILE = os.path.join(DATA_DIR, "peers.json")
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
+os.makedirs(HISTORY_DIR, exist_ok=True)
 
 
 # === RSA Key Management ===
@@ -27,7 +35,7 @@ def load_rsa_keys():
     return private_key, public_key
 
 
-# === User Data ===
+# === User Accounts ===
 def load_users():
     if os.path.exists(USERS_FILE):
         with open(USERS_FILE, "r") as f:
@@ -37,7 +45,7 @@ def load_users():
 
 def save_users(users):
     with open(USERS_FILE, "w") as f:
-        json.dump(users, f)
+        json.dump(users, f, indent=2)
 
 
 def hash_password(password: str) -> str:
@@ -65,14 +73,14 @@ def validate_login(username: str, password: str):
 # === Profile Management ===
 def save_profile(profile: dict):
     with open(PROFILE_FILE, "w") as f:
-        json.dump(profile, f)
+        json.dump(profile, f, indent=2)
 
 
 def load_profile():
     if os.path.exists(PROFILE_FILE):
         with open(PROFILE_FILE, "r") as f:
             return json.load(f)
-    return {}
+    return {"username": None, "status": ""}
 
 
 # === Fingerprint (short ID) ===
@@ -83,3 +91,53 @@ def get_fingerprint(public_key) -> str:
         format=serialization.PublicFormat.SubjectPublicKeyInfo
     )
     return hashlib.sha256(pem).hexdigest()[:16]
+
+
+# === Peer Management (Persistent) ===
+def load_peers():
+    if os.path.exists(PEERS_FILE):
+        with open(PEERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_peers(peers):
+    with open(PEERS_FILE, "w") as f:
+        json.dump(peers, f, indent=2)
+
+
+def add_peer(peer_id, username, ip, port):
+    peers = load_peers()
+    peers[peer_id] = {"username": username, "ip": ip, "port": port}
+    save_peers(peers)
+
+
+# === Chat History ===
+def history_path(peer_id):
+    return os.path.join(HISTORY_DIR, f"{peer_id}.json")
+
+
+def save_message(peer_id, sender, message):
+    path = history_path(peer_id)
+    history = []
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            history = json.load(f)
+
+    history.append({
+        "sender": sender,
+        "message": message,
+        "time": datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    })
+
+    with open(path, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def load_history(peer_id, last_n=100):
+    path = history_path(peer_id)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            history = json.load(f)
+        return history[-last_n:]
+    return []
