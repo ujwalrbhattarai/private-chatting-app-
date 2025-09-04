@@ -58,47 +58,67 @@ def load_chat_history(contact_id):
 # === Networking & Peer Handling ===
 
 class PeerConnection(threading.Thread):
-    def __init__(self, app, sock, addr, peer_id=None, is_initiator=False):
+    def __init__(self, app, sock, addr, peer_id=None, is_initiator=False, debug=False):
         super().__init__(daemon=True)
         self.app = app
         self.sock = sock
         self.addr = addr
         self.peer_id = peer_id  # Remote user's ID
         self.is_initiator = is_initiator
-        self.session_key = generate_aes_key()
+        self.debug = debug
+
+        # IMPORTANT: we only generate a key if we're the initiator.
+        # The responder adopts the initiator's key from the hello message.
+        self.session_key = generate_aes_key() if is_initiator else None
         self.running = True
+
+    def log(self, *a):
+        if self.debug:
+            print("[Peer]", *a)
 
     def run(self):
         try:
             # Perform handshake: exchange user_ids and confirm connection
             if self.is_initiator:
-                # Send own ID and session_key (encoded)
+                # Send own ID and (shared) session_key (encoded)
                 hello = json.dumps({
                     "type": "hello",
                     "user_id": self.app.user_id,
                     "session_key": base64.b64encode(self.session_key).decode()
                 }) + "\n"
                 self.sock.sendall(hello.encode())
+                self.log("initiator sent hello with key")
 
                 # Receive remote hello
                 remote_hello = self.receive_line()
+                if not remote_hello:
+                    raise ConnectionError("No hello from peer.")
                 self.process_hello(remote_hello)
 
-                self.app.notify_connection(self.peer_id or self.addr[0], self)
+                # Always use the correct peer_id after handshake
+                self.app.notify_connection(self.peer_id, self)
             else:
                 # Receive hello first
                 hello = self.receive_line()
+                if not hello:
+                    raise ConnectionError("No hello from initiator.")
                 self.process_hello(hello)
 
-                # Send back own hello
+                # Send back own hello WITHOUT generating/sending a new key
                 hello_back = json.dumps({
                     "type": "hello",
-                    "user_id": self.app.user_id,
-                    "session_key": base64.b64encode(self.session_key).decode()
+                    "user_id": self.app.user_id
+                    # no session_key here; we already adopted initiator's key
                 }) + "\n"
                 self.sock.sendall(hello_back.encode())
+                self.log("responder sent hello back (no key)")
 
-                self.app.notify_connection(self.peer_id or self.addr[0], self)
+                # Always use the correct peer_id after handshake
+                self.app.notify_connection(self.peer_id, self)
+
+            # Sanity check: we must have a session key by now
+            if not self.session_key:
+                raise RuntimeError("Handshake failed: no shared session key established.")
 
             # Listen to messages
             while self.running:
@@ -107,66 +127,98 @@ class PeerConnection(threading.Thread):
                     break
                 self.app.receive_message(self, line)
         except Exception as e:
-            #print("Connection error:", e)
-            pass
+            self.log("Connection error:", repr(e))
         finally:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except Exception:
+                pass
             self.app.disconnect(self)
 
     def receive_line(self):
         buf = b""
-        while not buf.endswith(b"\n"):
-            data = self.sock.recv(1024)
-            if not data:
-                return None
-            buf += data
-        return buf.decode().strip()
+        try:
+            while not buf.endswith(b"\n"):
+                data = self.sock.recv(1024)
+                if not data:
+                    return None
+                buf += data
+            return buf.decode().strip()
+        except Exception as e:
+            self.log("receive_line error:", repr(e))
+            return None
 
     def send_message(self, plaintext):
+        if not self.session_key:
+            raise RuntimeError("No session key; handshake not complete.")
         encrypted = encrypt_message(self.session_key, plaintext)
         payload = json.dumps({"type": "chat", "data": encrypted}) + "\n"
         try:
             self.sock.sendall(payload.encode())
-        except:
+        except Exception as e:
+            self.log("send_message error:", repr(e))
             self.running = False
 
     def process_hello(self, data):
-        obj = json.loads(data)
-        if obj.get("type") == "hello":
-            self.peer_id = obj.get("user_id")
-            remote_key_b64 = obj.get("session_key")
-            if remote_key_b64:
-                remote_key = base64.b64decode(remote_key_b64)
-                # For simplicity, use session key generated locally.
-                # In real E2E use a key agreement protocol & combine keys
-            else:
-                pass
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError:
+            self.log("Invalid hello JSON:", data)
+            return
+
+        if obj.get("type") != "hello":
+            self.log("Unexpected message type during handshake:", obj.get("type"))
+            return
+
+        # Set peer id
+        self.peer_id = obj.get("user_id", self.peer_id)
+
+        # Adopt session key ONLY if we don't already have one (i.e., responder side)
+        remote_key_b64 = obj.get("session_key")
+        if self.session_key is None and remote_key_b64:
+            try:
+                self.session_key = base64.b64decode(remote_key_b64)
+                self.log("Adopted session key from initiator")
+            except Exception as e:
+                self.log("Failed to decode remote session key:", repr(e))
 
 class ChatServer(threading.Thread):
-    def __init__(self, app, host='0.0.0.0', port=5000):
+    def __init__(self, app, host='0.0.0.0', port=5000, debug=False):
         super().__init__(daemon=True)
         self.app = app
         self.host = host
         self.port = port
         self.sock = None
         self.running = True
+        self.debug = debug
+
+    def log(self, *a):
+        if self.debug:
+            print("[Server]", *a)
 
     def run(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Allow quick restart
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.host, self.port))
         self.sock.listen()
+        self.log(f"listening on {self.host}:{self.port}")
         while self.running:
             try:
                 client, addr = self.sock.accept()
-                peer = PeerConnection(self.app, client, addr, is_initiator=False)
+                self.log("accepted", addr)
+                peer = PeerConnection(self.app, client, addr, is_initiator=False, debug=self.debug)
                 peer.start()
             except Exception as e:
-                pass
+                self.log("accept error:", repr(e))
 
     def stop(self):
         self.running = False
         if self.sock:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
 # === Main App UI ===
 
@@ -178,6 +230,7 @@ class P2PChatApp(tk.Tk):
 
         self.user_id = self.generate_user_id()
         self.connections = {}  # peer_id -> PeerConnection
+        self.current_peer_id = None
 
         self.create_widgets()
         self.server = ChatServer(self)
@@ -227,6 +280,19 @@ class P2PChatApp(tk.Tk):
             self.connections[peer_id] = peer_conn
             self.contacts_list.insert(tk.END, peer_id)
             messagebox.showinfo("Connection Request", f"User {peer_id} connected.")
+            # Automatically select the new contact for chat
+            self.contacts_list.selection_clear(0, tk.END)
+            idxs = self.contacts_list.get(0, tk.END)
+            if peer_id in idxs:
+                i = idxs.index(peer_id)
+                self.contacts_list.selection_set(i)
+                self.current_peer_id = peer_id
+                self.chat_label.config(text=f"Chatting with {peer_id}")
+                self.chat_area.config(state=tk.NORMAL)
+                self.chat_area.delete(1.0, tk.END)
+                history = load_chat_history(peer_id)
+                self.chat_area.insert(tk.END, history)
+                self.chat_area.config(state=tk.DISABLED)
 
     def prompt_connect(self):
         # Ask for friend's ID in format IP:PORT
@@ -234,7 +300,7 @@ class P2PChatApp(tk.Tk):
         if not friend_id or ':' not in friend_id:
             messagebox.showerror("Error", "Invalid ID format. Use IP:PORT")
             return
-        ip, port = friend_id.split(':')
+        ip, port = friend_id.split(':', 1)
         try:
             port = int(port)
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -246,7 +312,10 @@ class P2PChatApp(tk.Tk):
 
     def copy_my_id(self):
         # Copy IP:PORT to clipboard
-        ip = socket.gethostbyname(socket.gethostname())
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            ip = "127.0.0.1"
         port = self.server.port
         my_id = f"{ip}:{port}"
         try:
@@ -269,21 +338,25 @@ class P2PChatApp(tk.Tk):
         self.chat_area.config(state=tk.DISABLED)
 
     def receive_message(self, peer_conn, json_data):
-        data = json.loads(json_data)
+        try:
+            data = json.loads(json_data)
+        except json.JSONDecodeError:
+            return
         if data.get("type") == "chat":
             msg_enc = data.get("data")
             try:
                 msg = decrypt_message(peer_conn.session_key, msg_enc)
                 display_text = f"{peer_conn.peer_id}: {msg}\n"
                 self.append_chat(peer_conn.peer_id, display_text)
-            except Exception as e:
+            except Exception:
+                # decryption failed; ignore silently or log if needed
                 pass
 
     def append_chat(self, peer_id, text):
-        if self.current_peer_id != peer_id:
+        if getattr(self, "current_peer_id", None) != peer_id:
             # Optionally notify user about messages from other contacts
             pass
-        if self.current_peer_id == peer_id:
+        if getattr(self, "current_peer_id", None) == peer_id:
             self.chat_area.config(state=tk.NORMAL)
             self.chat_area.insert(tk.END, text)
             self.chat_area.config(state=tk.DISABLED)
