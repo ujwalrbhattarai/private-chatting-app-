@@ -1,0 +1,49 @@
+# Sensitive files - never commit these
+*.pem
+private_key.*
+public_key.*
+users.json
+profile.json
+settings.json
+
+# User data directories
+.p2pchat/
+keys/
+history/
+downloads/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Temporary files
+tempCodeRunnerFile.py
+*.tmp
+*.temp
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
+.env.production
+.env.staging
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
